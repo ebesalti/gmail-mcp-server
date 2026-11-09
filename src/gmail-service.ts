@@ -618,8 +618,14 @@ export function parseMailto(uri: string): { to: string; subject: string; body: s
   const params = new URLSearchParams(query);
   const get = (k: string) =>
     [...params.entries()].find(([n]) => n.toLowerCase() === k)?.[1];
+  const to = decodeURIComponent(addr).trim();
+  // The sender controls this value. Allow exactly one plain address so a crafted
+  // header cannot inject extra headers (Bcc:) or extra recipients.
+  if (!/^[^\s@,;<>"()\\]+@[^\s@,;<>"()\\]+\.[^\s@,;<>"()\\]+$/.test(to)) {
+    throw new Error(`Refusing unsubscribe mailto with an unsafe or multiple address: ${JSON.stringify(to)}`);
+  }
   return {
-    to: decodeURIComponent(addr),
+    to,
     subject: get("subject") || "Unsubscribe",
     body: get("body") || "Unsubscribe",
   };

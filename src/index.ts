@@ -3,7 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { google } from "googleapis";
 import { z } from "zod";
-import { timingSafeEqual } from "node:crypto";
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { GmailService } from "./gmail-service.js";
 import { TokenStore } from "./token-store.js";
 
@@ -19,6 +19,27 @@ const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD!;
 // The MCP endpoint lives at /mcp/<MCP_SECRET>. Claude custom connectors cannot
 // send a header, so the secret in the path is what keeps the mailbox private.
 const MCP_SECRET = process.env.MCP_SECRET!;
+
+// Refuse to start with a missing secret. An unset ADMIN_PASSWORD used to let
+// requests without a password through the admin check.
+const missing = [
+  "GOOGLE_CLIENT_ID",
+  "GOOGLE_CLIENT_SECRET",
+  "ADMIN_PASSWORD",
+  "MCP_SECRET",
+  "ENCRYPTION_KEY",
+].filter((k) => !process.env[k]);
+if (missing.length) {
+  throw new Error(`Missing required environment variables: ${missing.join(", ")}`);
+}
+if (MCP_SECRET.length < 32) throw new Error("MCP_SECRET must be at least 32 characters");
+if (ADMIN_PASSWORD.length < 16) throw new Error("ADMIN_PASSWORD must be at least 16 characters");
+
+const SECURE_COOKIES = SERVER_URL.startsWith("https://");
+const SESSION_COOKIE = "gmcp_admin";
+const STATE_COOKIE = "gmcp_oauth_state";
+const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
+
 const SCOPES = [
   "https://www.googleapis.com/auth/gmail.readonly",
   "https://www.googleapis.com/auth/gmail.modify",
@@ -142,7 +163,7 @@ function createMcpServer(): McpServer {
     },
     async ({ account, query, max_results }) => {
       const accounts = resolveAccounts(account);
-      const allResults: Array<{ account: string; emails: any[] }> = [];
+      const allResults: Array<{ account: string; emails: any[]; error?: string }> = [];
 
       for (const email of accounts) {
         try {
@@ -150,10 +171,7 @@ function createMcpServer(): McpServer {
           const emails = await gmail.listEmails(query, max_results);
           allResults.push({ account: email, emails });
         } catch (err: any) {
-          allResults.push({
-            account: email,
-            emails: [],
-          });
+          allResults.push({ account: email, emails: [], error: err?.message ?? String(err) });
         }
       }
 
@@ -256,7 +274,7 @@ function createMcpServer(): McpServer {
   // ---- unsubscribe_email ----
   server.tool(
     "unsubscribe_email",
-    "Unsubscribe from a mailing list. Uses RFC 8058 one-click POST when offered, else sends the List-Unsubscribe mailto from this account. Returns status: confirmed | sent | needs_manual_click (links in manualLinks) | failed. Only confirmed/sent count as done.",
+    "Unsubscribe from a mailing list. May SEND an email from this account (List-Unsubscribe mailto). Uses RFC 8058 one-click POST when offered, else sends the List-Unsubscribe mailto from this account. Returns status: confirmed | sent | needs_manual_click (links in manualLinks) | failed. Only confirmed/sent count as done.",
     {
       account: z
         .string()
@@ -415,7 +433,7 @@ function createMcpServer(): McpServer {
     },
     async ({ account, query, max_results }) => {
       const accounts = resolveAccounts(account);
-      const allResults: Array<{ account: string; emails: any[] }> = [];
+      const allResults: Array<{ account: string; emails: any[]; error?: string }> = [];
 
       for (const email of accounts) {
         try {
@@ -423,7 +441,7 @@ function createMcpServer(): McpServer {
           const emails = await gmail.batchProcess(query, max_results);
           allResults.push({ account: email, emails });
         } catch (err: any) {
-          allResults.push({ account: email, emails: [] });
+          allResults.push({ account: email, emails: [], error: err?.message ?? String(err) });
         }
       }
 
@@ -472,36 +490,91 @@ function escapeHtml(s: string): string {
   return s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 }
 
-function secretMatches(given: string | undefined): boolean {
-  if (!MCP_SECRET || !given) return false;
+function safeEqual(given: string | undefined, expected: string): boolean {
+  if (!given || !expected) return false;
   const a = Buffer.from(given);
-  const b = Buffer.from(MCP_SECRET);
+  const b = Buffer.from(expected);
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
+function secretMatches(given: string | undefined): boolean {
+  return safeEqual(given, MCP_SECRET);
+}
+
 // ---------------------------------------------------------------------------
-// Admin auth middleware for /setup routes
+// Admin session: password is POSTed once, then an HMAC-signed HttpOnly cookie.
+// The password never appears in a URL, a log line or the OAuth state.
 // ---------------------------------------------------------------------------
+
+function readCookie(req: Request, name: string): string | undefined {
+  for (const part of (req.headers.cookie ?? "").split(";")) {
+    const i = part.indexOf("=");
+    if (i > 0 && part.slice(0, i).trim() === name) {
+      return decodeURIComponent(part.slice(i + 1).trim());
+    }
+  }
+  return undefined;
+}
+
+function cookieAttrs(maxAgeSeconds: number): string {
+  return `Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAgeSeconds}${SECURE_COOKIES ? "; Secure" : ""}`;
+}
+
+function sign(value: string): string {
+  return createHmac("sha256", `${ADMIN_PASSWORD}|${MCP_SECRET}`).update(value).digest("hex");
+}
+
+function makeSession(): string {
+  const expires = Date.now() + SESSION_TTL_MS;
+  return `${expires}.${sign(`admin:${expires}`)}`;
+}
+
+function sessionValid(req: Request): boolean {
+  const cookie = readCookie(req, SESSION_COOKIE);
+  if (!cookie) return false;
+  const [expires, mac] = cookie.split(".");
+  if (!expires || !mac || Number(expires) < Date.now()) return false;
+  return safeEqual(mac, sign(`admin:${expires}`));
+}
+
+function loginPage(res: Response, status: number, error?: string): void {
+  res.status(status).send(`
+    <html><body style="font-family:system-ui;max-width:400px;margin:80px auto;text-align:center">
+      <h2>Admin Login</h2>
+      ${error ? `<p style="color:#c00">${escapeHtml(error)}</p>` : ""}
+      <form method="POST" action="/setup/login">
+        <input type="password" name="password" placeholder="Admin password" autocomplete="current-password" style="padding:8px;width:100%;box-sizing:border-box;margin-bottom:12px" />
+        <button type="submit" style="padding:8px 24px">Login</button>
+      </form>
+    </body></html>
+  `);
+}
 
 function requireAdmin(req: Request, res: Response, next: NextFunction): void {
-  const key =
-    req.query.key as string | undefined ??
-    req.headers["x-admin-key"] as string | undefined;
-
-  if (key !== ADMIN_PASSWORD) {
-    res.status(401).send(`
-      <html><body style="font-family:system-ui;max-width:400px;margin:80px auto;text-align:center">
-        <h2>Admin Login</h2>
-        <form method="GET">
-          <input type="password" name="key" placeholder="Admin password" style="padding:8px;width:100%;box-sizing:border-box;margin-bottom:12px" />
-          <button type="submit" style="padding:8px 24px">Login</button>
-        </form>
-      </body></html>
-    `);
+  if (!sessionValid(req)) {
+    loginPage(res, 401);
     return;
   }
   next();
 }
+
+function setupRedirect(res: Response, message: string): void {
+  res.redirect(`/setup?message=${encodeURIComponent(message)}`);
+}
+
+app.post("/setup/login", (req: Request, res: Response) => {
+  if (!safeEqual(req.body?.password, ADMIN_PASSWORD)) {
+    loginPage(res, 401, "Wrong password");
+    return;
+  }
+  res.setHeader("Set-Cookie", `${SESSION_COOKIE}=${makeSession()}; ${cookieAttrs(SESSION_TTL_MS / 1000)}`);
+  res.redirect("/setup");
+});
+
+app.post("/setup/logout", (_req: Request, res: Response) => {
+  res.setHeader("Set-Cookie", `${SESSION_COOKIE}=; ${cookieAttrs(0)}`);
+  res.redirect("/setup");
+});
 
 // ---------------------------------------------------------------------------
 // Setup page — manage connected Gmail accounts
@@ -509,7 +582,6 @@ function requireAdmin(req: Request, res: Response, next: NextFunction): void {
 
 app.get("/setup", requireAdmin, (_req: Request, res: Response) => {
   const accounts = tokenStore.listAccounts();
-  const key = _req.query.key as string;
   const message = _req.query.message as string | undefined;
 
   const accountRows = accounts.length > 0
@@ -517,12 +589,12 @@ app.get("/setup", requireAdmin, (_req: Request, res: Response) => {
         .map(
           (a) => `
         <tr>
-          <td>${a.email}</td>
-          <td>${new Date(a.addedAt).toLocaleDateString()}</td>
+          <td>${escapeHtml(a.email)}</td>
+          <td>${escapeHtml(new Date(a.addedAt).toLocaleDateString())}</td>
           <td>
-            <form method="POST" action="/setup/remove?key=${encodeURIComponent(key)}" style="display:inline">
-              <input type="hidden" name="email" value="${a.email}" />
-              <button type="submit" onclick="return confirm('Remove ${a.email}?')" style="color:red;background:none;border:1px solid red;padding:4px 12px;cursor:pointer">Remove</button>
+            <form method="POST" action="/setup/remove" style="display:inline" onsubmit="return confirm('Remove this account?')">
+              <input type="hidden" name="email" value="${escapeHtml(a.email)}" />
+              <button type="submit" style="color:red;background:none;border:1px solid red;padding:4px 12px;cursor:pointer">Remove</button>
             </form>
           </td>
         </tr>`
@@ -554,7 +626,10 @@ app.get("/setup", requireAdmin, (_req: Request, res: Response) => {
         <thead><tr><th>Account</th><th>Added</th><th></th></tr></thead>
         <tbody>${accountRows}</tbody>
       </table>
-      <a class="btn" href="/oauth/start?key=${encodeURIComponent(key)}">+ Add Gmail Account</a>
+      <a class="btn" href="/oauth/start">+ Add Gmail Account</a>
+      <form method="POST" action="/setup/logout" style="display:inline;margin-left:12px">
+        <button type="submit" style="background:none;border:none;color:#888;cursor:pointer">Log out</button>
+      </form>
       <hr style="margin-top:40px;border:none;border-top:1px solid #eee" />
       <p style="color:#888;font-size:13px">
         MCP endpoint: <code>${SERVER_URL}/mcp/${MCP_SECRET}</code><br/>
@@ -566,14 +641,13 @@ app.get("/setup", requireAdmin, (_req: Request, res: Response) => {
 });
 
 app.post("/setup/remove", requireAdmin, async (req: Request, res: Response) => {
-  const email = req.body.email;
-  const key = req.query.key as string;
+  const email = req.body?.email;
 
   if (email && tokenStore.hasAccount(email)) {
     await tokenStore.removeAccount(email);
-    res.redirect(`/setup?key=${encodeURIComponent(key)}&message=${encodeURIComponent(`Removed ${email}`)}`);
+    setupRedirect(res, `Removed ${email}`);
   } else {
-    res.redirect(`/setup?key=${encodeURIComponent(key)}&message=${encodeURIComponent("Account not found")}`);
+    setupRedirect(res, "Account not found");
   }
 });
 
@@ -581,40 +655,42 @@ app.post("/setup/remove", requireAdmin, async (req: Request, res: Response) => {
 // OAuth flow — server-managed Google auth
 // ---------------------------------------------------------------------------
 
-app.get("/oauth/start", (req: Request, res: Response) => {
-  const key = req.query.key as string;
-  if (key !== ADMIN_PASSWORD) {
-    res.status(401).send("Unauthorized");
-    return;
-  }
+app.get("/oauth/start", requireAdmin, (_req: Request, res: Response) => {
+  // One-time random state, bound to this browser by an HttpOnly cookie.
+  const state = randomBytes(24).toString("hex");
+  res.setHeader("Set-Cookie", `${STATE_COOKIE}=${state}; ${cookieAttrs(600)}`);
 
   const oauth2 = makeOAuth2Client();
   const url = oauth2.generateAuthUrl({
     access_type: "offline",
     prompt: "consent",
     scope: SCOPES,
-    state: key, // pass admin key through OAuth flow
+    state,
   });
 
   res.redirect(url);
 });
 
 app.get("/oauth/callback", async (req: Request, res: Response) => {
-  const code = req.query.code as string;
-  const state = req.query.state as string;
-  const error = req.query.error as string;
+  const code = req.query.code as string | undefined;
+  const state = req.query.state as string | undefined;
+  const error = req.query.error as string | undefined;
+  const expectedState = readCookie(req, STATE_COOKIE);
+  res.setHeader("Set-Cookie", `${STATE_COOKIE}=; ${cookieAttrs(0)}`);
+
+  // Only a logged-in admin who started this exact flow may add an account.
+  if (!sessionValid(req) || !expectedState || !safeEqual(state, expectedState)) {
+    res.status(403).send("Invalid or expired OAuth state. Start again from /setup.");
+    return;
+  }
 
   if (error) {
-    res.redirect(
-      `/setup?key=${encodeURIComponent(state)}&message=${encodeURIComponent(`OAuth error: ${error}`)}`
-    );
+    setupRedirect(res, `OAuth error: ${error}`);
     return;
   }
 
   if (!code) {
-    res.redirect(
-      `/setup?key=${encodeURIComponent(state)}&message=${encodeURIComponent("No authorization code received")}`
-    );
+    setupRedirect(res, "No authorization code received");
     return;
   }
 
@@ -623,9 +699,7 @@ app.get("/oauth/callback", async (req: Request, res: Response) => {
     const { tokens } = await oauth2.getToken(code);
 
     if (!tokens.refresh_token) {
-      res.redirect(
-        `/setup?key=${encodeURIComponent(state)}&message=${encodeURIComponent("No refresh token received. Try removing the app from your Google account permissions and re-adding.")}`
-      );
+      setupRedirect(res, "No refresh token received. Try removing the app from your Google account permissions and re-adding.");
       return;
     }
 
@@ -636,22 +710,15 @@ app.get("/oauth/callback", async (req: Request, res: Response) => {
     const email = userInfo.data.email;
 
     if (!email) {
-      res.redirect(
-        `/setup?key=${encodeURIComponent(state)}&message=${encodeURIComponent("Could not determine email address")}`
-      );
+      setupRedirect(res, "Could not determine email address");
       return;
     }
 
     await tokenStore.addAccount(email, tokens.refresh_token);
-
-    res.redirect(
-      `/setup?key=${encodeURIComponent(state)}&message=${encodeURIComponent(`Successfully connected ${email}`)}`
-    );
+    setupRedirect(res, `Successfully connected ${email}`);
   } catch (err: any) {
-    console.error("[oauth/callback] Error:", err);
-    res.redirect(
-      `/setup?key=${encodeURIComponent(state)}&message=${encodeURIComponent(`Error: ${err.message}`)}`
-    );
+    console.error("[oauth/callback] Error:", err?.message ?? err);
+    setupRedirect(res, `Error: ${err?.message ?? "unknown"}`);
   }
 });
 

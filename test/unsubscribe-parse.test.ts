@@ -15,4 +15,12 @@ assert.equal(m.subject, "unsubscribe me");
 assert.equal(m.body, "Unsubscribe");
 
 assert.deepEqual(parseListUnsubscribe(""), { https: [], http: [], mailto: undefined });
+
+// Header injection and multiple recipients must be refused.
+assert.throws(() => parseMailto("mailto:a@x.com%0D%0ABcc:victim@y.com"));
+assert.throws(() => parseMailto("mailto:a@x.com%0ABcc:victim@y.com"));
+assert.throws(() => parseMailto("mailto:a@x.com,victim@y.com"));
+assert.throws(() => parseMailto("mailto:a@x.com%2Cvictim@y.com"));
+assert.throws(() => parseMailto("mailto:Name%20%3Ca@x.com%3E"));
+assert.throws(() => parseMailto("mailto:"));
 console.log("unsubscribe parse tests: OK");
